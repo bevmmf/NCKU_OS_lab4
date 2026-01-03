@@ -74,9 +74,10 @@ struct inode *osfs_iget(struct super_block *sb, unsigned long ino)
     inode->i_mode = osfs_inode->i_mode;
     i_uid_write(inode, osfs_inode->i_uid);
     i_gid_write(inode, osfs_inode->i_gid);
-    inode->__i_atime = osfs_inode->__i_atime;
-    inode->__i_mtime = osfs_inode->__i_mtime;
-    inode->__i_ctime = osfs_inode->__i_ctime;
+    // Fix for Linux Kernel 6.6+ timestamp access
+    inode_set_atime_to_ts(inode, osfs_inode->__i_atime);
+    inode_set_mtime_to_ts(inode, osfs_inode->__i_mtime);
+    inode_set_ctime_to_ts(inode, osfs_inode->__i_ctime);
     inode->i_size = osfs_inode->i_size;
     inode->i_blocks = osfs_inode->i_blocks;
     inode->i_private = osfs_inode;

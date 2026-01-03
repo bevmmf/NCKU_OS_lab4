@@ -298,7 +298,7 @@ static int osfs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry
     pr_info("osfs_create: File '%.*s' created with inode %lu\n",
             (int)dentry->d_name.len, dentry->d_name.name, inode->i_ino);
 
-    return 0;
+    return 0;    
 }
 
 

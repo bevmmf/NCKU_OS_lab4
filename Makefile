@@ -11,5 +11,9 @@ all:
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
 
+load:
+	sudo insmod osfs.ko
+unload:
+	sudo rmmod osfs.ko
 
 
