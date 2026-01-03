@@ -107,6 +107,21 @@ int osfs_fill_super(struct super_block *sb, void *data, int silent)
     root_osfs_inode->i_ino = ROOT_INODE;
     root_osfs_inode->i_mode = root_inode->i_mode;
     root_osfs_inode->i_links_count = 2;
+
+    uint32_t root_block;
+    int ret_alloc = osfs_alloc_extent_block(sb_info, 1, &root_block);
+    if (ret_alloc) {
+        pr_err("osfs: Failed to allocate root directory block\n");
+        iput(root_inode);
+        vfree(memory_region);
+        return ret_alloc;
+    }
+    root_osfs_inode->extents[0].ee_block = 0;
+    root_osfs_inode->extents[0].ee_start = root_block;
+    root_osfs_inode->extents[0].ee_len = 1;
+    root_osfs_inode->extent_count = 1;
+    root_osfs_inode->i_blocks = 1;
+
     root_osfs_inode->__i_atime = root_osfs_inode->__i_mtime = root_osfs_inode->__i_ctime = current_time(root_inode);
     root_inode->i_private = root_osfs_inode;
 

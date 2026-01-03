@@ -127,3 +127,44 @@ void osfs_free_data_block(struct osfs_sb_info *sb_info, uint32_t block_no)
     clear_bit(block_no, sb_info->block_bitmap);
     sb_info->nr_free_blocks++;
 }
+
+/**
+ * Function: osfs_alloc_extent_block
+ * Description: Allocates 'count' contiguous data blocks.
+ * Returns: Starting block number on success, -ENOSPC on failure.
+ */
+int osfs_alloc_extent_block(struct osfs_sb_info *sb_info, uint32_t count, uint32_t *start_block)
+{
+    uint32_t i, j;
+    uint32_t free_count = 0;
+    uint32_t start_candidate = 0;
+    bool found = false;
+
+    // simple way : scan bitmap for continuous 0 number of count  
+    for (i = 0; i < sb_info->block_count; i++) {
+        if (!test_bit(i, sb_info->block_bitmap)) {
+            if (free_count == 0) start_candidate = i;
+            free_count++;
+            if (free_count == count) {
+                found = true;
+                break;
+            }
+        } else {
+            free_count = 0; // stop and redo
+        }
+    }
+
+    if (!found) {
+        pr_err("osfs: No contiguous block sequence of size %d found\n", count);
+        return -ENOSPC;
+    }
+
+    // write bitmap
+    for (j = 0; j < count; j++) {
+        set_bit(start_candidate + j, sb_info->block_bitmap);
+    }
+    sb_info->nr_free_blocks -= count;
+    *start_block = start_candidate;
+
+    return 0;
+}

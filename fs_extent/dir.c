@@ -27,8 +27,10 @@ static struct dentry *osfs_lookup(struct inode *dir, struct dentry *dentry, unsi
     pr_info("osfs_lookup: Looking up '%.*s' in inode %lu\n",
             (int)dentry->d_name.len, dentry->d_name.name, dir->i_ino);
 
+    uint32_t phys_block = osfs_get_phys_block(parent_inode, 0);
+    if (phys_block == 0) return NULL; // Should not happen for valid dir
     // Read the parent directory's data block
-    dir_data_block = sb_info->data_blocks + parent_inode->i_block * BLOCK_SIZE;
+    dir_data_block = sb_info->data_blocks + phys_block * BLOCK_SIZE;
 
     // Calculate the number of directory entries
     dir_entry_count = parent_inode->i_size / sizeof(struct osfs_dir_entry);
@@ -76,7 +78,10 @@ static int osfs_iterate(struct file *filp, struct dir_context *ctx)
             return 0;
     }
 
-    dir_data_block = sb_info->data_blocks + osfs_inode->i_block * BLOCK_SIZE;
+    uint32_t phys_block = osfs_get_phys_block(osfs_inode, 0);
+    if (phys_block == 0) return 0;
+
+    dir_data_block = sb_info->data_blocks + phys_block * BLOCK_SIZE;
     dir_entry_count = osfs_inode->i_size / sizeof(struct osfs_dir_entry);
     dir_entries = (struct osfs_dir_entry *)dir_data_block;
 
@@ -177,17 +182,42 @@ struct inode *osfs_new_inode(const struct inode *dir, umode_t mode)
     osfs_inode->i_mode = inode->i_mode;
     osfs_inode->i_uid = i_uid_read(inode);
     osfs_inode->i_gid = i_gid_read(inode);
-    osfs_inode->i_size = inode->i_size;
-    osfs_inode->i_blocks = 1; // Simplified handling
+    osfs_inode->i_size = 0;
+    //
+    osfs_inode->i_blocks = 0;
+    osfs_inode->extent_count = 0;
+    if (S_ISDIR(mode)) {
+        uint32_t new_phys_block;
+        int ret_alloc = osfs_alloc_extent_block(sb_info, 1, &new_phys_block);
+        if (ret_alloc) {
+            iput(inode);
+            return ERR_PTR(ret_alloc);
+        }
+        osfs_inode->extents[0].ee_block = 0;
+        osfs_inode->extents[0].ee_start = new_phys_block;
+        osfs_inode->extents[0].ee_len = 1;
+        osfs_inode->extent_count = 1;
+        osfs_inode->i_blocks = 1;
+    }
+    //
     osfs_inode->__i_atime = osfs_inode->__i_mtime = osfs_inode->__i_ctime = current_time(inode);
     inode->i_private = osfs_inode;
 
     /* Allocate data block */
-    ret = osfs_alloc_data_block(sb_info, &osfs_inode->i_block);
+    uint32_t new_phys_block_no;
+    ret = osfs_alloc_extent_block(sb_info, 1, &new_phys_block_no);
+    
     if (ret) {
         pr_err("osfs_new_inode: Failed to allocate data block\n");
         iput(inode);
         return ERR_PTR(ret);
+    }else {
+        struct osfs_extent *new_ext = &osfs_inode->extents[osfs_inode->extent_count];
+        new_ext->ee_start = new_phys_block_no;  
+        new_ext->ee_len = 1;
+        new_ext->ee_block = 0; 
+        osfs_inode->extent_count++; 
+        osfs_inode->i_blocks++;     
     }
 
     /* Update superblock information */
@@ -207,12 +237,27 @@ static int osfs_add_dir_entry(struct inode *dir, uint32_t inode_no, const char *
     struct osfs_dir_entry *dir_entries;
     int dir_entry_count;
     int i;
+    dir_entry_count = parent_inode->i_size / sizeof(struct osfs_dir_entry);
+    uint32_t logical_block = dir_entry_count / MAX_DIR_ENTRIES;
 
+    uint32_t phys_block = osfs_get_phys_block(parent_inode, 0);
+
+    // If not exist them allocate
+    if (phys_block == 0) {
+        if (parent_inode->extent_count >= OSFS_MAX_EXTENTS) return -ENOSPC;
+        int ret = osfs_alloc_extent_block(sb_info, 1, &phys_block);
+        if (ret) return ret;
+
+        parent_inode->extents[parent_inode->extent_count].ee_block = logical_block;
+        parent_inode->extents[parent_inode->extent_count].ee_start = phys_block;
+        parent_inode->extents[parent_inode->extent_count].ee_len = 1;
+        parent_inode->extent_count++;
+        parent_inode->i_blocks++;
+    }
     // Read the parent directory's data block
-    dir_data_block = sb_info->data_blocks + parent_inode->i_block * BLOCK_SIZE;
+    dir_data_block = sb_info->data_blocks + phys_block * BLOCK_SIZE;
 
     // Calculate the existing number of directory entries
-    dir_entry_count = parent_inode->i_size / sizeof(struct osfs_dir_entry);
     if (dir_entry_count >= MAX_DIR_ENTRIES) {
         pr_err("osfs_add_dir_entry: Parent directory is full\n");
         return -ENOSPC;
@@ -281,7 +326,6 @@ static int osfs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry
         return -EIO;
     }
     // init osfs_inode attribute
-    osfs_inode->i_block = 0; 
     osfs_inode->i_size = 0;
     osfs_inode->i_blocks = 0;
 

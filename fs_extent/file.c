@@ -3,6 +3,26 @@
 #include "osfs.h"
 
 /**
+ * Function: osfs_get_phys_block
+ * Description: Maps a logical block number to a physical block number using extents.
+ * Returns: Physical block number, or 0 if not mapped.
+ */
+uint32_t osfs_get_phys_block(struct osfs_inode *osfs_inode, uint32_t logical_block)
+{
+    int i;
+    for (i = 0; i < osfs_inode->extent_count; i++) {
+        struct osfs_extent *ext = &osfs_inode->extents[i];
+        
+        if (logical_block >= ext->ee_block && 
+            logical_block < (ext->ee_block + ext->ee_len)) {
+            uint32_t offset = logical_block - ext->ee_block;
+            return ext->ee_start + offset;
+        }
+    }
+    return 0; // Not mapped (Sparse file or End of File)
+}
+
+/**
  * Function: osfs_read
  * Description: Reads data from a file.
  * Inputs:
@@ -27,19 +47,26 @@ static ssize_t osfs_read(struct file *filp, char __user *buf, size_t len, loff_t
     if (osfs_inode->i_blocks == 0)
         return 0;
 
-    if (*ppos >= osfs_inode->i_size)
-        return 0;
+    if (*ppos >= osfs_inode->i_size) return 0;
+    
+    uint32_t logical_block_num = *ppos / BLOCK_SIZE;
+    uint32_t block_offset = *ppos % BLOCK_SIZE;
+    
+    uint32_t phys_block = osfs_get_phys_block(osfs_inode, logical_block_num);
+    
+    if (phys_block == 0) return 0; 
 
-    if (*ppos + len > osfs_inode->i_size)
-        len = osfs_inode->i_size - *ppos;
+    data_block = sb_info->data_blocks + phys_block * BLOCK_SIZE + block_offset;
+    
+    bytes_read = len;
+    if (block_offset + len > BLOCK_SIZE) {
+        bytes_read = BLOCK_SIZE - block_offset;
+    }
 
-    data_block = sb_info->data_blocks + osfs_inode->i_block * BLOCK_SIZE + *ppos;
-    if (copy_to_user(buf, data_block, len))
+    if (copy_to_user(buf, data_block, bytes_read))
         return -EFAULT;
 
-    *ppos += len;
-    bytes_read = len;
-
+    *ppos += bytes_read;
     return bytes_read;
 }
 
@@ -67,42 +94,55 @@ static ssize_t osfs_write(struct file *filp, const char __user *buf, size_t len,
     ssize_t bytes_written;
     int ret;
 
-    // Step2: Check if a data block has been allocated; if not, allocate one
-    if (osfs_inode->i_blocks == 0) {
-        ret = osfs_alloc_data_block(sb_info, &osfs_inode->i_block);
-        if (ret)
-            return ret; // 分配失敗 (如 ENOSPC)
-        osfs_inode->i_blocks = 1;
-        inode->i_blocks = 1;
+    // extent
+    uint32_t logical_block_num = *ppos / BLOCK_SIZE;
+    uint32_t block_offset = *ppos % BLOCK_SIZE;
+    
+    // 1. try to find remaining Block
+    uint32_t phys_block = osfs_get_phys_block(osfs_inode, logical_block_num);
+    
+    // 2. If not found then create Extent
+    if (phys_block == 0) {
+        if (osfs_inode->extent_count >= OSFS_MAX_EXTENTS) return -ENOSPC; // full
+
+        uint32_t new_phys_block;
+        ret = osfs_alloc_extent_block(sb_info, 1, &new_phys_block); 
+        if (ret) return ret;
+        
+        // create extent
+        struct osfs_extent *new_ext = &osfs_inode->extents[osfs_inode->extent_count];
+        new_ext->ee_block = logical_block_num;
+        new_ext->ee_start = new_phys_block;
+        new_ext->ee_len = 1;
+        
+        osfs_inode->extent_count++;
+        osfs_inode->i_blocks++; 
+        
+        phys_block = new_phys_block;
     }
 
-    // Step3: Limit the write length to fit within one data block
-    if (*ppos >= BLOCK_SIZE)
-        return -ENOSPC;
-
-    if (*ppos + len > BLOCK_SIZE)
-        len = BLOCK_SIZE - *ppos;
-
-    // Step4: Write data from user space to the data block
-    data_block = sb_info->data_blocks + osfs_inode->i_block * BLOCK_SIZE + *ppos;
-    
-    if (copy_from_user(data_block, buf, len))
-        return -EFAULT;
-
-    // Step5: Update inode & osfs_inode attribute
-    *ppos += len;
+    // 3. write date
+    data_block = sb_info->data_blocks + phys_block * BLOCK_SIZE + block_offset;
     bytes_written = len;
+    if (block_offset + len > BLOCK_SIZE) bytes_written = BLOCK_SIZE - block_offset;
 
+    if (copy_from_user(data_block, buf, bytes_written)) return -EFAULT;
+
+    *ppos += bytes_written;
+    
+    // update file size
     if (*ppos > osfs_inode->i_size) {
         osfs_inode->i_size = *ppos;
         inode->i_size = *ppos;
     }
-
+    
+    // update time
     inode_set_mtime_to_ts(inode, current_time(inode));
     inode_set_ctime_to_ts(inode, current_time(inode));
-    mark_inode_dirty(inode);
 
-    // Step6: Return the number of bytes written
+    // mark kernel inode dirty
+    mark_inode_dirty(inode);    
+
     return bytes_written;
 }
 

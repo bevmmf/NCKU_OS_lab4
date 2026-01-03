@@ -25,6 +25,9 @@
 
 #define ROOT_INODE 1            // Define the root inode as 1
 
+// max extent per inode
+#define OSFS_MAX_EXTENTS 15
+
 /**
  * Struct: osfs_sb_info
  * Description: Superblock information for the osfs filesystem.
@@ -52,6 +55,16 @@ struct osfs_dir_entry {
 };
 
 /**
+ * Struct: osfs_extent
+ * Description: Mapping from logical block to physical block.
+ */
+struct osfs_extent {
+    uint32_t ee_block;  // Logical start block
+    uint32_t ee_len;    // Number of blocks 
+    uint32_t ee_start;  // Physical start block
+};
+
+/**
  * Struct: osfs_inode
  * Description: Filesystem-specific inode structure.
  */
@@ -66,17 +79,22 @@ struct osfs_inode {
     struct timespec64 __i_atime;        // Last access time
     struct timespec64 __i_mtime;        // Last modification time
     struct timespec64 __i_ctime;        // Creation time
-    uint32_t i_block;                   // Simplified handling, single data block pointer
+    // allocation object
+    uint32_t extent_count;                          // already used extent count
+    struct osfs_extent extents[OSFS_MAX_EXTENTS];   // extent array
 };
 
 struct inode *osfs_iget(struct super_block *sb, unsigned long ino);
 struct osfs_inode *osfs_get_osfs_inode(struct super_block *sb, uint32_t ino);
 int osfs_get_free_inode(struct osfs_sb_info *sb_info);
 int osfs_alloc_data_block(struct osfs_sb_info *sb_info, uint32_t *block_no);
+int osfs_alloc_extent_block(struct osfs_sb_info *sb_info, uint32_t count, uint32_t *start_block);
 int osfs_fill_super(struct super_block *sb, void *data, int silent);
 struct inode *osfs_new_inode(const struct inode *dir, umode_t mode);
 void osfs_free_data_block(struct osfs_sb_info *sb_info, uint32_t block_no);
 void osfs_destroy_inode(struct inode *inode);
+uint32_t osfs_get_phys_block(struct osfs_inode *osfs_inode, uint32_t logical_block);
+int osfs_alloc_extent_block(struct osfs_sb_info *sb_info, uint32_t count, uint32_t *start_block);
 // External Operations Structures
 
 extern const struct inode_operations osfs_file_inode_operations;
