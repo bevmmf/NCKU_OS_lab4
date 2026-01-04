@@ -74,6 +74,10 @@ int osfs_fill_super(struct super_block *sb, void *data, int silent)
     // Initialize bitmaps
     memset(sb_info->inode_bitmap, 0, INODE_BITMAP_SIZE * sizeof(unsigned long));
     memset(sb_info->block_bitmap, 0, BLOCK_BITMAP_SIZE * sizeof(unsigned long));
+    
+    // [Fix] Reserve Block 0
+    set_bit(0, sb_info->block_bitmap);
+    sb_info->nr_free_blocks--;
 
     // Set superblock fields
     sb->s_magic = sb_info->magic;

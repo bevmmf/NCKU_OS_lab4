@@ -20,34 +20,40 @@ static struct dentry *osfs_lookup(struct inode *dir, struct dentry *dentry, unsi
     struct osfs_inode *parent_inode = dir->i_private;
     void *dir_data_block;
     struct osfs_dir_entry *dir_entries;
-    int dir_entry_count;
     int i;
     struct inode *inode = NULL;
 
     pr_info("osfs_lookup: Looking up '%.*s' in inode %lu\n",
             (int)dentry->d_name.len, dentry->d_name.name, dir->i_ino);
 
-    uint32_t phys_block = osfs_get_phys_block(parent_inode, 0);
-    if (phys_block == 0) return NULL; // Should not happen for valid dir
-    // Read the parent directory's data block
-    dir_data_block = sb_info->data_blocks + phys_block * BLOCK_SIZE;
+    // Iterate through all logical blocks to find the file
+    int dir_entry_count = parent_inode->i_size / sizeof(struct osfs_dir_entry);
+    int entries_checked = 0;
+    int logical_block = 0;
 
-    // Calculate the number of directory entries
-    dir_entry_count = parent_inode->i_size / sizeof(struct osfs_dir_entry);
-    dir_entries = (struct osfs_dir_entry *)dir_data_block;
+    while (entries_checked < dir_entry_count) {
+        uint32_t phys_block = osfs_get_phys_block(parent_inode, logical_block);
+        if (phys_block == 0) break; // Should not happen if size is correct
 
-    // Traverse the directory entries to find a matching filename
-    for (i = 0; i < dir_entry_count; i++) {
-        if (strlen(dir_entries[i].filename) == dentry->d_name.len &&
-            strncmp(dir_entries[i].filename, dentry->d_name.name, dentry->d_name.len) == 0) {
-            // File found, get inode
-            inode = osfs_iget(dir->i_sb, dir_entries[i].inode_no);
-            if (IS_ERR(inode)) {
-                pr_err("osfs_lookup: Error getting inode %u\n", dir_entries[i].inode_no);
-                return ERR_CAST(inode);
-            }
-            return d_splice_alias(inode, dentry);
-        }
+        dir_data_block = sb_info->data_blocks + phys_block * BLOCK_SIZE;
+        dir_entries = (struct osfs_dir_entry *)dir_data_block;
+
+        int entries_in_this_block = MAX_DIR_ENTRIES;
+        if (entries_checked + entries_in_this_block > dir_entry_count)
+            entries_in_this_block = dir_entry_count - entries_checked;
+
+        for (i = 0; i < entries_in_this_block; i++) {
+            if (strlen(dir_entries[i].filename) == dentry->d_name.len &&
+                strncmp(dir_entries[i].filename, dentry->d_name.name, dentry->d_name.len) == 0) 
+            {
+                
+                inode = osfs_iget(dir->i_sb, dir_entries[i].inode_no);
+                if (IS_ERR(inode)) return ERR_CAST(inode);
+                return d_splice_alias(inode, dentry);
+             }
+         }
+        entries_checked += entries_in_this_block;
+        logical_block++;
     }
 
     return NULL;
@@ -70,35 +76,44 @@ static int osfs_iterate(struct file *filp, struct dir_context *ctx)
     struct osfs_inode *osfs_inode = inode->i_private;
     void *dir_data_block;
     struct osfs_dir_entry *dir_entries;
-    int dir_entry_count;
-    int i;
 
     if (ctx->pos == 0) {
         if (!dir_emit_dots(filp, ctx))
             return 0;
     }
 
-    uint32_t phys_block = osfs_get_phys_block(osfs_inode, 0);
-    if (phys_block == 0) return 0;
+    int total_entries = osfs_inode->i_size / sizeof(struct osfs_dir_entry);
+    int current_index = ctx->pos - 2; // skip . and ..
 
-    dir_data_block = sb_info->data_blocks + phys_block * BLOCK_SIZE;
-    dir_entry_count = osfs_inode->i_size / sizeof(struct osfs_dir_entry);
-    dir_entries = (struct osfs_dir_entry *)dir_data_block;
 
-    /* Adjust the index based on ctx->pos */
-    i = ctx->pos - 2;
+    if (current_index >= total_entries) return 0;
 
-    for (; i < dir_entry_count; i++) {
-        struct osfs_dir_entry *entry = &dir_entries[i];
-        unsigned int type = DT_UNKNOWN;
 
-        if (!dir_emit(ctx, entry->filename, strlen(entry->filename), entry->inode_no, type)) {
-            pr_err("osfs_iterate: dir_emit failed for entry '%s'\n", entry->filename);
-            return -EINVAL;
-        }
+    // Support cross-block iteration
+    uint32_t logical_block = current_index / MAX_DIR_ENTRIES;
+    uint32_t entry_offset = current_index % MAX_DIR_ENTRIES;
 
-        ctx->pos++;
-    }
+    while (current_index < total_entries) {
+        uint32_t phys_block = osfs_get_phys_block(osfs_inode, logical_block);
+        if (phys_block == 0) break;
+ 
+        dir_data_block = sb_info->data_blocks + phys_block * BLOCK_SIZE;
+        dir_entries = (struct osfs_dir_entry *)dir_data_block;
+
+        // Read entries in current block
+        for (int i = entry_offset; i < MAX_DIR_ENTRIES && current_index < total_entries; i++) {
+            struct osfs_dir_entry *entry = &dir_entries[i];
+            
+            if (!dir_emit(ctx, entry->filename, strlen(entry->filename), entry->inode_no, DT_UNKNOWN))
+                return 0; // Buffer full
+
+            ctx->pos++;
+            current_index++;
+         }
+        
+        logical_block++;
+        entry_offset = 0; // Reset offset for next block
+     }
 
     return 0;
 }
@@ -122,7 +137,7 @@ struct inode *osfs_new_inode(const struct inode *dir, umode_t mode)
     struct osfs_sb_info *sb_info = sb->s_fs_info;
     struct inode *inode;
     struct osfs_inode *osfs_inode;
-    int ino, ret;
+    int ino;
 
     /* Check if the mode is supported */
     if (!S_ISDIR(mode) && !S_ISREG(mode) && !S_ISLNK(mode)) {
@@ -203,23 +218,6 @@ struct inode *osfs_new_inode(const struct inode *dir, umode_t mode)
     osfs_inode->__i_atime = osfs_inode->__i_mtime = osfs_inode->__i_ctime = current_time(inode);
     inode->i_private = osfs_inode;
 
-    /* Allocate data block */
-    uint32_t new_phys_block_no;
-    ret = osfs_alloc_extent_block(sb_info, 1, &new_phys_block_no);
-    
-    if (ret) {
-        pr_err("osfs_new_inode: Failed to allocate data block\n");
-        iput(inode);
-        return ERR_PTR(ret);
-    }else {
-        struct osfs_extent *new_ext = &osfs_inode->extents[osfs_inode->extent_count];
-        new_ext->ee_start = new_phys_block_no;  
-        new_ext->ee_len = 1;
-        new_ext->ee_block = 0; 
-        osfs_inode->extent_count++; 
-        osfs_inode->i_blocks++;     
-    }
-
     /* Update superblock information */
     sb_info->nr_free_inodes--;
 
@@ -240,19 +238,37 @@ static int osfs_add_dir_entry(struct inode *dir, uint32_t inode_no, const char *
     dir_entry_count = parent_inode->i_size / sizeof(struct osfs_dir_entry);
     uint32_t logical_block = dir_entry_count / MAX_DIR_ENTRIES;
 
-    uint32_t phys_block = osfs_get_phys_block(parent_inode, 0);
+    uint32_t phys_block = osfs_get_phys_block(parent_inode, logical_block);
 
-    // If not exist them allocate
+    // If not exist then allocate
     if (phys_block == 0) {
-        if (parent_inode->extent_count >= OSFS_MAX_EXTENTS) return -ENOSPC;
-        int ret = osfs_alloc_extent_block(sb_info, 1, &phys_block);
+        // Try to merge before alloc
+        uint32_t new_phys_block;
+        int ret = osfs_alloc_extent_block(sb_info, 1, &new_phys_block);
+
         if (ret) return ret;
 
-        parent_inode->extents[parent_inode->extent_count].ee_block = logical_block;
-        parent_inode->extents[parent_inode->extent_count].ee_start = phys_block;
-        parent_inode->extents[parent_inode->extent_count].ee_len = 1;
-        parent_inode->extent_count++;
+        int merged = 0;
+        if (parent_inode->extent_count > 0) {
+            struct osfs_extent *last_ext = &parent_inode->extents[parent_inode->extent_count - 1];
+            // Check for merge with previous extent
+            if (last_ext->ee_block + last_ext->ee_len == logical_block &&
+                last_ext->ee_start + last_ext->ee_len == new_phys_block) {
+                last_ext->ee_len++;
+                merged = 1;
+            }
+        }
+
+        if (!merged) {
+            if (parent_inode->extent_count >= OSFS_MAX_EXTENTS) return -ENOSPC;
+            parent_inode->extents[parent_inode->extent_count].ee_block = logical_block;
+            parent_inode->extents[parent_inode->extent_count].ee_start = new_phys_block;
+            parent_inode->extents[parent_inode->extent_count].ee_len = 1;
+            parent_inode->extent_count++;
+        }
         parent_inode->i_blocks++;
+        dir->i_blocks = parent_inode->i_blocks; // Sync VFS
+        phys_block = new_phys_block;
     }
     // Read the parent directory's data block
     dir_data_block = sb_info->data_blocks + phys_block * BLOCK_SIZE;
@@ -327,7 +343,6 @@ static int osfs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry
     }
     // init osfs_inode attribute
     osfs_inode->i_size = 0;
-    osfs_inode->i_blocks = 0;
 
     // Step4: Parent directory entry update for the new file
     ret = osfs_add_dir_entry(dir, inode->i_ino, dentry->d_name.name, dentry->d_name.len);

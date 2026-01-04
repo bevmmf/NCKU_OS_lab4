@@ -103,22 +103,46 @@ static ssize_t osfs_write(struct file *filp, const char __user *buf, size_t len,
     
     // 2. If not found then create Extent
     if (phys_block == 0) {
-        if (osfs_inode->extent_count >= OSFS_MAX_EXTENTS) return -ENOSPC; // full
-
+        // Multi-block Allocation Strategy
+        uint32_t blocks_needed = (block_offset + len + BLOCK_SIZE - 1) / BLOCK_SIZE; // ideal number of blocks needed for the remaining data
         uint32_t new_phys_block;
-        ret = osfs_alloc_extent_block(sb_info, 1, &new_phys_block); 
-        if (ret) return ret;
         
-        // create extent
-        struct osfs_extent *new_ext = &osfs_inode->extents[osfs_inode->extent_count];
-        new_ext->ee_block = logical_block_num;
-        new_ext->ee_start = new_phys_block;
-        new_ext->ee_len = 1;
+        // allocate all required blocks at once
+        ret = osfs_alloc_extent_block(sb_info, blocks_needed, &new_phys_block);
+        if (ret) {
+            // [Fallback] If sufficient contiguous space is unavailable, revert to single block allocation
+            blocks_needed = 1;
+            ret = osfs_alloc_extent_block(sb_info, 1, &new_phys_block);
+            if (ret) return ret; // No any space left (ENOSPC)
+        }
+
+        // Extent Merging Strategy
+        int merged = 0;
+        if (osfs_inode->extent_count > 0) {
+            struct osfs_extent *last_ext = &osfs_inode->extents[osfs_inode->extent_count - 1];
+            
+            // check Physical Contiguity and Logical Contiguity
+            if ((last_ext->ee_start + last_ext->ee_len == new_phys_block) &&
+                (last_ext->ee_block + last_ext->ee_len == logical_block_num)) {                
+                // Merge successful: extend the last extent, do not create a new one
+                last_ext->ee_len += blocks_needed;
+                merged = 1;
+            }
+        }
+
+        if (!merged) {
+            if (osfs_inode->extent_count >= OSFS_MAX_EXTENTS) return -ENOSPC; // Extent array is full
+            struct osfs_extent *new_ext = &osfs_inode->extents[osfs_inode->extent_count];
+            new_ext->ee_block = logical_block_num;
+            new_ext->ee_start = new_phys_block;
+            new_ext->ee_len = blocks_needed;
+            osfs_inode->extent_count++;
+        }
         
-        osfs_inode->extent_count++;
-        osfs_inode->i_blocks++; 
+        osfs_inode->i_blocks += blocks_needed;
+        inode->i_blocks = osfs_inode->i_blocks; // sync VFS inode
         
-        phys_block = new_phys_block;
+        phys_block = new_phys_block;        
     }
 
     // 3. write date
